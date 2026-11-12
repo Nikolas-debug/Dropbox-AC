@@ -1,0 +1,1046 @@
+<!doctype html>
+<!--
+  SUBIDA MASIVA A DROPBOX
+  =======================
+  Los archivos van del navegador a Dropbox DIRECTO. No pasan por ningun
+  servidor nuestro: Apps Script solo entrega el token (tope de 50 MB por
+  peticion y 6 min por ejecucion, asi que los bytes no caben por ahi).
+
+  Cada archivo se lee por trozos con File.slice(), asi que da igual que pese
+  2 GB o 150: nunca se carga entero en memoria.
+
+  Mientras sube, calcula el content_hash de Dropbox (SHA-256 por bloques de
+  4 MB y luego SHA-256 de los digests concatenados) y lo compara con el que
+  devuelve el servidor. Eso convierte "creo que subio todo" en una lista
+  verificada archivo por archivo.
+
+  IMPORTANTE: tiene que servirse por https o desde http://localhost.
+  Abierta con doble clic (file://) el navegador desactiva crypto.subtle y el
+  selector de carpetas, y nada de esto funciona.
+-->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subida masiva a Dropbox</title>
+<style>
+  :root {
+    --azul: #005b8e; --azul-oscuro: #003d5c; --gris: #4a6070;
+    --borde: #d7e3ec; --suave: #f0f8ff; --texto: #1a2b38;
+    --ok: #00695c; --mal: #b3261e; --ojo: #a8710a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px 16px 60px;
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    color: var(--texto); background: #f7fafc;
+  }
+  .caja {
+    max-width: 920px; margin: 0 auto 18px; background: #fff;
+    border: 1px solid var(--borde); border-radius: 10px; padding: 18px 20px;
+  }
+  .caja.principal { border-left: 4px solid var(--azul); }
+  h1 { margin: 0 0 4px; font-size: 1.25rem; color: var(--azul-oscuro); }
+  .perfil { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }
+  .perfil h1 { margin: 0; font-size: 1.3rem; line-height: 1.2; }
+  .avatar {
+    width: 64px; height: 64px; flex: 0 0 auto;
+    border-radius: 50%; object-fit: cover;
+    border: 2px solid var(--borde); background: #fff;
+  }
+  .rol {
+    margin: 3px 0 0; font-size: .78rem; font-weight: 600; color: var(--gris);
+    text-transform: uppercase; letter-spacing: .06em;
+  }
+  h2 { margin: 0 0 10px; font-size: .95rem; color: var(--azul-oscuro);
+       text-transform: uppercase; letter-spacing: .05em; }
+  p.lead { margin: 0 0 16px; color: var(--gris); font-size: .9rem; }
+  label { display: block; font-size: .8rem; font-weight: 600;
+          color: var(--gris); margin-bottom: 4px; }
+  input[type=text] {
+    width: 100%; padding: .55rem .7rem; font-size: 1rem; color: var(--texto);
+    border: 1px solid #c3d4e0; border-radius: 7px; font-family: inherit;
+  }
+  input[type=text]:focus { outline: 2px solid var(--azul); outline-offset: 1px; }
+  .fila { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+  .fila > div { flex: 1 1 260px; }
+  button {
+    padding: .55rem 1.1rem; font: 600 .9rem inherit; color: #fff;
+    background: var(--azul); border: 1px solid var(--azul);
+    border-radius: 7px; cursor: pointer; white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #00486f; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.sec { color: var(--azul-oscuro); background: #fff; border-color: #b0cfe0; }
+  button.sec:hover:not(:disabled) { background: var(--suave); }
+  button.peligro { background: var(--mal); border-color: var(--mal); }
+  .pill {
+    display: inline-block; font-size: .78rem; font-weight: 600;
+    padding: .15rem .65rem; border-radius: 999px;
+    background: var(--suave); border: 1px solid var(--borde); color: var(--gris);
+  }
+  .pill.ok { color: var(--ok); background: #e6f6f1; border-color: #bfe6da; }
+  .pill.mal { color: var(--mal); background: #fdecea; border-color: #f5c6c2; }
+  .barra { height: 10px; background: #e8eff5; border-radius: 999px; overflow: hidden; margin: 12px 0 6px; }
+  .barra > div { height: 100%; width: 0; background: var(--azul); transition: width .25s; }
+  .cifras { display: flex; gap: 22px; flex-wrap: wrap; font-size: .85rem; color: var(--gris); }
+  .cifras b { display: block; font-size: 1.15rem; color: var(--texto); font-weight: 700;
+              font-variant-numeric: tabular-nums; }
+  #log {
+    margin-top: 12px; max-height: 260px; overflow: auto; font-size: .78rem;
+    font-family: ui-monospace, Menlo, Consolas, monospace; line-height: 1.45;
+    background: #fbfdff; border: 1px solid var(--borde); border-radius: 7px; padding: 8px 10px;
+  }
+  #log div { white-space: pre-wrap; word-break: break-word; }
+  .l-mal { color: var(--mal); } .l-ok { color: var(--ok); } .l-ojo { color: var(--ojo); }
+  .aviso { padding: 10px 12px; border-radius: 7px; font-size: .86rem; margin-bottom: 12px; }
+  .aviso.mal { background: #fdecea; border: 1px solid #f5c6c2; color: #7a1c15; }
+  .aviso.ojo { background: #fff8e8; border: 1px solid #f3dfae; color: #6b4a08; }
+  .oculto { display: none !important; }
+  ul.probs { margin: 8px 0 0; padding-left: 18px; font-size: .83rem; color: var(--gris); }
+  ul.probs li { margin-bottom: 2px; }
+  code { background: var(--suave); padding: .1rem .3rem; border-radius: 4px; font-size: .9em; }
+</style>
+</head>
+<body>
+
+<div class="caja principal">
+  <div class="perfil">
+    <img class="avatar" alt="" aria-hidden="true"
+         src="data:image/png;base64,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">
+    <div>
+      <!-- ================= EL NOMBRE VA AQUI ================= -->
+      <h1>Nombre y apellido</h1>
+      <!-- ====================================================== -->
+      <p class="rol">Subida masiva a Dropbox</p>
+    </div>
+  </div>
+  <p class="lead">
+    Los archivos van del navegador a Dropbox directo, por trozos, y se verifican
+    con el hash de Dropbox al terminar cada uno. Se puede cerrar y volver a
+    empezar: lo que ya esta arriba se salta.
+  </p>
+
+  <div id="avisoEntorno" class="aviso mal oculto"></div>
+
+  <div class="fila">
+    <div>
+      <label for="destino">Carpeta de destino en Dropbox</label>
+      <input type="text" id="destino" value="/archivo" spellcheck="false"
+             placeholder="/archivo-2026">
+    </div>
+    <div style="flex:0 0 auto">
+      <button id="btnConectar">Conectar</button>
+    </div>
+    <div style="flex:0 0 auto">
+      <span class="pill" id="estadoConexion">sin conectar</span>
+    </div>
+    <div style="flex:0 0 auto">
+      <button class="sec oculto" id="btnOlvidar">Olvidar</button>
+    </div>
+  </div>
+
+  <div id="pkceCaja" class="aviso ojo oculto" style="margin-top:14px">
+    <p style="margin:0 0 10px"><b>Autorice una sola vez.</b>
+      <a id="pkceEnlace" target="_blank" rel="noopener">Abra esta pagina de Dropbox</a>,
+      acepte, y pegue abajo el codigo que le muestra.</p>
+    <div class="fila">
+      <div><input type="text" id="pkceCodigo" placeholder="Pegue aqui el codigo de Dropbox" spellcheck="false"></div>
+      <div style="flex:0 0 auto"><button id="pkceValidar">Validar</button></div>
+    </div>
+  </div>
+</div>
+
+<div class="caja">
+  <h2>1 · Elegir qué subir</h2>
+  <div class="fila">
+    <div style="flex:0 0 auto"><button class="sec" id="btnCarpeta">Elegir carpeta…</button></div>
+    <div style="flex:0 0 auto"><button class="sec" id="btnArchivos">Elegir archivos (o el zip)…</button></div>
+    <div style="flex:0 0 auto"><span class="pill" id="estadoSeleccion">nada elegido</span></div>
+  </div>
+  <input type="file" id="inputCarpeta" webkitdirectory directory multiple class="oculto">
+  <input type="file" id="inputArchivos" multiple class="oculto">
+
+  <div id="inventario" class="oculto" style="margin-top:14px">
+    <div class="cifras">
+      <div><b id="invArchivos">0</b> archivos</div>
+      <div><b id="invPeso">0</b> de datos</div>
+      <div><b id="invProblemas">0</b> con problemas</div>
+    </div>
+    <div id="destinoPrevia" class="aviso" style="margin-top:12px;background:var(--suave);border:1px solid var(--borde);color:var(--gris)"></div>
+    <div id="avisoDoble" class="aviso ojo oculto" style="margin-top:10px"></div>
+    <div id="avisoProblemas" class="aviso ojo oculto" style="margin-top:12px"></div>
+  </div>
+</div>
+
+<div class="caja">
+  <h2>2 · Subir</h2>
+  <div class="fila">
+    <div style="flex:0 0 auto"><button id="btnSubir" disabled>Subir</button></div>
+    <div style="flex:0 0 auto"><button class="sec" id="btnVerificar" disabled>Verificar todo</button></div>
+    <div style="flex:0 0 auto"><button class="peligro oculto" id="btnParar">Parar</button></div>
+    <div style="flex:0 0 auto"><button class="sec" id="btnInforme" disabled>Descargar informe</button></div>
+  </div>
+
+  <div class="barra"><div id="barra"></div></div>
+  <div class="cifras">
+    <div><b id="cHechos">0</b> subidos</div>
+    <div><b id="cSaltados">0</b> ya estaban</div>
+    <div><b id="cFallos">0</b> fallaron</div>
+    <div><b id="cPeso">0</b> transferido</div>
+    <div><b id="cVel">—</b> velocidad</div>
+    <div><b id="cFalta">—</b> falta</div>
+  </div>
+
+  <div id="log"></div>
+</div>
+
+<!-- La configuracion va aparte para que actualizar esta pagina no borre
+     la ruta ni el secreto. Si el archivo no esta, se usan los valores de
+     abajo y en la consola saldra un 404 de este <script>, inofensivo. -->
+<script src="subida-config.js"></script>
+
+<script>
+/* ===================================================================== */
+/*  CONFIGURACION                                                        */
+/*  No hace falta tocar nada aqui: edite subida-config.js.               */
+/* ===================================================================== */
+
+const CFG = {
+  /* De donde saca el token. Dos opciones:
+
+     1) api/subida-token.php  (recomendado) — en el mismo dominio que esta
+        pagina, asi que no hay CORS de por medio.
+
+     2) la URL /exec de SubidaToken.gs. Funciona, pero solo si el despliegue
+        quedo en «Quien tiene acceso: Cualquier usuario». Con cualquier otra
+        opcion Google redirige al login, esa respuesta no lleva
+        Access-Control-Allow-Origin y el navegador bloquea la llamada.
+        Para comprobarlo: abra la URL en incognito; debe verse el texto del
+        repartidor, no una pantalla de Google. */
+  REPARTIDOR: 'api/subida-token.php',
+
+  /* Solo para el repartidor en PHP o Apps Script, que esperan un secreto
+     compartido en el cuerpo. Con el servicio de Railway sobra: ahi la
+     pagina y el token estan detras de la misma autenticacion del
+     navegador, y no hay ningun valor secreto escrito en el repositorio. */
+  SECRETO: '',
+
+  /* Tamano de trozo. Multiplo de 4 MB (el bloque del hash de Dropbox).
+     Maximo que acepta Dropbox: 150 MB. 48 es un buen punto medio. */
+  TROZO: 48 * 1024 * 1024,
+
+  /* Archivos en paralelo. Dropbox bloquea por carpeta al escribir; subir de
+     mas provoca 429 "too_many_write_operations" y acaba siendo mas lento. */
+  EN_PARALELO: 3,
+
+  /* Reintentos por peticion antes de dar el archivo por fallido. */
+  REINTENTOS: 8
+};
+
+/* Lo que diga subida-config.js manda sobre los valores de arriba. */
+if (window.SUBIDA_CFG) Object.assign(CFG, window.SUBIDA_CFG);
+
+const BLOQUE_HASH = 4 * 1024 * 1024;
+
+/* El content_hash de Dropbox se calcula por bloques de 4 MB, y aqui se va
+   calculando sobre la marcha mientras se sube. Si el trozo de subida no es
+   multiplo de 4 MB, los bloques se desalinean y el hash sale distinto del
+   que devuelve Dropbox: parecerian corruptos archivos que estan perfectos. */
+if (CFG.TROZO % BLOQUE_HASH !== 0) {
+  throw new Error('CFG.TROZO debe ser multiplo de 4 MB (4194304). Ahora vale ' + CFG.TROZO);
+}
+if (CFG.TROZO > 150 * 1024 * 1024) {
+  throw new Error('CFG.TROZO no puede pasar de 150 MB: es el tope de Dropbox.');
+}
+const HASH_VACIO = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
+/* ===================================================================== */
+/*  ESTADO                                                               */
+/* ===================================================================== */
+
+let TOKEN = null;
+let LISTA = [];          // [{rel, size, tomar()}]
+let REMOTO = new Map();  // ruta en minusculas -> {size, hash}
+let INFORME = [];
+let PARAR = false;
+let CORRIENDO = false;
+
+const $ = (id) => document.getElementById(id);
+
+/* ===================================================================== */
+/*  ARRANQUE                                                             */
+/* ===================================================================== */
+
+(function comprobarEntorno() {
+  const faltas = [];
+  if (!window.isSecureContext || !window.crypto || !crypto.subtle) {
+    faltas.push('Esta pagina necesita abrirse por <b>https</b> o desde ' +
+      '<b>http://localhost</b>. Abierta con doble clic (file://) el navegador ' +
+      'desactiva el calculo de hashes y no se puede verificar nada.');
+  }
+  if (!window.showDirectoryPicker) {
+    faltas.push('Este navegador no tiene el selector de carpetas moderno. ' +
+      'El boton «Elegir carpeta» va a funcionar igual, pero con carpetas muy ' +
+      'grandes puede tardar en abrirse. Chrome o Edge van mejor.');
+  }
+  if (faltas.length) {
+    const c = $('avisoEntorno');
+    c.innerHTML = faltas.join('<br><br>');
+    c.classList.remove('oculto');
+    if (!window.isSecureContext) c.classList.add('mal');
+  }
+})();
+
+/* ===================================================================== */
+/*  REGISTRO                                                             */
+/* ===================================================================== */
+
+function log(msg, clase) {
+  const d = document.createElement('div');
+  if (clase) d.className = clase;
+  const h = new Date().toTimeString().slice(0, 8);
+  d.textContent = h + '  ' + msg;
+  const caja = $('log');
+  caja.appendChild(d);
+  while (caja.childElementCount > 500) caja.removeChild(caja.firstChild);
+  caja.scrollTop = caja.scrollHeight;
+}
+
+const pesoTxt = (b) => {
+  if (b < 1024) return b + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1, n = b;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 1) + ' ' + u[i];
+};
+
+const tiempoTxt = (s) => {
+  if (!isFinite(s) || s < 0) return '—';
+  if (s < 60) return Math.round(s) + ' s';
+  if (s < 3600) return Math.round(s / 60) + ' min';
+  const h = Math.floor(s / 3600);
+  return h + ' h ' + Math.round((s - h * 3600) / 60) + ' min';
+};
+
+const dormir = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ===================================================================== */
+/*  TOKEN                                                                */
+/* ===================================================================== */
+
+/* ---------------------------------------------------------------------
+   PKCE: la pagina se autoriza contra Dropbox sin servidor de por medio y
+   sin el App secret. Se autoriza una vez; a partir de ahi guarda el
+   refresh token y se renueva sola, que es lo que hace falta para una
+   subida que dura dias.
+   --------------------------------------------------------------------- */
+
+const LLAVE_REFRESH = 'subida_refresh_token';
+const LLAVE_VERIF   = 'subida_code_verifier';
+const usaPkce = () => !!(CFG.APP_KEY && String(CFG.APP_KEY).trim());
+
+const guardar = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+const leer    = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+const borrar  = (k) => { try { localStorage.removeItem(k); } catch (e) {} };
+
+function base64url(buf) {
+  return btoa(String.fromCharCode.apply(null, new Uint8Array(buf)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function nuevoVerificador() {
+  const bytes = new Uint8Array(64);
+  crypto.getRandomValues(bytes);
+  const verif = base64url(bytes.buffer).slice(0, 96);
+  const reto = base64url(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verif)));
+  return { verif, reto };
+}
+
+async function enlaceDeAutorizacion() {
+  const { verif, reto } = await nuevoVerificador();
+  guardar(LLAVE_VERIF, verif);
+  return 'https://www.dropbox.com/oauth2/authorize' +
+    '?client_id=' + encodeURIComponent(CFG.APP_KEY) +
+    '&response_type=code&code_challenge=' + reto +
+    '&code_challenge_method=S256&token_access_type=offline';
+}
+
+/* El endpoint de token acepta form-urlencoded y no lleva cabeceras raras,
+   asi que el navegador lo manda sin preflight y Dropbox responde con CORS. */
+async function pedirADropbox(campos) {
+  const r = await fetch('https://api.dropboxapi.com/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(campos).toString()
+  });
+  const txt = await r.text();
+  let d;
+  try { d = JSON.parse(txt); }
+  catch (e) { throw new Error('Dropbox contesto HTTP ' + r.status + ': ' + txt.slice(0, 200)); }
+  if (!r.ok) {
+    throw new Error('Dropbox ' + r.status + ': ' +
+      (d.error_description || d.error_summary || d.error || txt.slice(0, 200)));
+  }
+  return d;
+}
+
+async function canjearCodigo(codigo) {
+  const verif = leer(LLAVE_VERIF);
+  if (!verif) throw new Error('Se perdio el verificador. Vuelva a pulsar Conectar.');
+  const d = await pedirADropbox({
+    code: String(codigo).trim(),
+    grant_type: 'authorization_code',
+    client_id: CFG.APP_KEY,
+    code_verifier: verif
+  });
+  if (!d.refresh_token) {
+    throw new Error('Dropbox no devolvio refresh_token: al enlace le falta ' +
+                    'token_access_type=offline.');
+  }
+  guardar(LLAVE_REFRESH, d.refresh_token);
+  borrar(LLAVE_VERIF);
+  return d.access_token;
+}
+
+async function tokenPorPkce() {
+  const refresh = leer(LLAVE_REFRESH);
+  if (!refresh) throw new Error('sin-autorizar');
+  const d = await pedirADropbox({
+    grant_type: 'refresh_token',
+    refresh_token: refresh,
+    client_id: CFG.APP_KEY
+  });
+  return d.access_token;
+}
+
+async function pedirToken(refrescar) {
+  if (usaPkce()) return tokenPorPkce();
+  return pedirTokenDelRepartidor(refrescar);
+}
+
+async function pedirTokenDelRepartidor(refrescar) {
+  const r = await fetch(CFG.REPARTIDOR, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    /* credentials: la autenticacion del navegador viaja sola y asi
+       /token queda protegido por lo mismo que la pagina. */
+    credentials: 'same-origin',
+    body: JSON.stringify({ secreto: CFG.SECRETO || '', refrescar: !!refrescar }),
+    redirect: 'follow'
+  });
+  if (r.status === 404) {
+    throw new Error('No existe «' + CFG.REPARTIDOR + '» en el servidor. ' +
+      'Compruebe como se llama de verdad el archivo PHP y corrija REPARTIDOR ' +
+      'en subida-config.js.');
+  }
+
+  const txt = await r.text();
+  let d;
+  try {
+    d = JSON.parse(txt);
+  } catch (e) {
+    /* Si PHP revienta antes de llegar a su JSON —error de sintaxis en el
+       config, un warning impreso, una pagina de error del hosting— lo que
+       llega es HTML o texto suelto. Mostrarlo tal cual ahorra mucho tiempo:
+       sin esto solo se sabe «no devolvio JSON», que no dice nada. */
+    const limpio = txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    throw new Error('El repartidor contesto HTTP ' + r.status + ' con algo que no es JSON: ' +
+                    (limpio ? '«' + limpio.slice(0, 300) + '»'
+                            : '(respuesta vacia; mire el archivo error_log de esa carpeta ' +
+                              'o cPanel → Métricas → Errores)'));
+  }
+  if (!d.ok) throw new Error('HTTP ' + r.status + ' — ' + (d.error || 'el repartidor rechazo la peticion.'));
+  return d.access_token;
+}
+
+$('btnConectar').addEventListener('click', async () => {
+  $('btnConectar').disabled = true;
+  $('estadoConexion').className = 'pill';
+  $('estadoConexion').textContent = 'conectando…';
+  try {
+    if (usaPkce() && !leer(LLAVE_REFRESH)) {
+      $('pkceEnlace').href = await enlaceDeAutorizacion();
+      $('pkceCaja').classList.remove('oculto');
+      $('estadoConexion').textContent = 'falta autorizar';
+      $('btnConectar').disabled = false;
+      log('Abra el enlace, autorice en Dropbox y pegue aqui el codigo.', 'l-ojo');
+      return;
+    }
+    TOKEN = await pedirToken(false);
+    const cuenta = await api('users/get_current_account', null);
+    const uso = await api('users/get_space_usage', null);
+    const total = (uso.allocation && (uso.allocation.allocated ||
+                  (uso.allocation.individual && uso.allocation.individual.allocated))) || 0;
+    $('estadoConexion').className = 'pill ok';
+    $('estadoConexion').textContent = cuenta.email || 'conectado';
+    log('Conectado como ' + (cuenta.email || '—'), 'l-ok');
+    if (total) {
+      const libre = total - (uso.used || 0);
+      log('Espacio libre en la cuenta: ' + pesoTxt(libre));
+    }
+    refrescarBotones();
+  } catch (e) {
+    $('estadoConexion').className = 'pill mal';
+    $('estadoConexion').textContent = 'sin conectar';
+    log('No se pudo conectar: ' + e.message, 'l-mal');
+  }
+  $('btnConectar').disabled = false;
+});
+
+/* ===================================================================== */
+/*  LLAMADAS A DROPBOX                                                   */
+/* ===================================================================== */
+
+/* El encabezado Dropbox-API-Arg solo admite ASCII: los acentos y las enes de
+   los nombres de archivo hay que escaparlos o Dropbox rechaza la peticion. */
+function argAscii(obj) {
+  return JSON.stringify(obj).replace(/[\u007f-￿]/g,
+    (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
+class ErrorDropbox extends Error {
+  constructor(estado, cuerpo) {
+    super('HTTP ' + estado + ': ' + String(cuerpo).slice(0, 200));
+    this.estado = estado;
+    this.cuerpo = String(cuerpo);
+  }
+}
+
+async function pedir(url, opciones) {
+  let renovaciones = 0;
+  for (let intento = 0; ; intento++) {
+    if (PARAR) throw new Error('detenido');
+    let r;
+    try {
+      r = await fetch(url, opciones);
+    } catch (e) {
+      /* Corte de red: reintentar como si fuera un 5xx. */
+      if (intento >= CFG.REINTENTOS) throw new Error('red: ' + e.message);
+      await dormir(espera(intento));
+      continue;
+    }
+
+    if (r.ok) return r;
+    const cuerpo = await r.text();
+
+    if (r.status === 401 && renovaciones < 3) {
+      renovaciones++;
+      log('Token caducado, pidiendo uno nuevo…');
+      TOKEN = await pedirToken(true);
+      opciones.headers['Authorization'] = 'Bearer ' + TOKEN;
+      continue;
+    }
+
+    const reintentable = r.status === 429 || r.status >= 500;
+    if (!reintentable || intento >= CFG.REINTENTOS) throw new ErrorDropbox(r.status, cuerpo);
+
+    let ms = espera(intento);
+    const ra = r.headers.get('Retry-After');
+    if (ra && !isNaN(Number(ra))) ms = Number(ra) * 1000 + 500;
+    else {
+      try {
+        const j = JSON.parse(cuerpo);
+        if (j.error && j.error.retry_after) ms = j.error.retry_after * 1000 + 500;
+      } catch (e) { /* el cuerpo no era JSON */ }
+    }
+    if (r.status === 429) log('Dropbox pide esperar ' + Math.round(ms / 1000) + ' s…', 'l-ojo');
+    await dormir(ms);
+  }
+}
+
+const espera = (i) => Math.min(60000, 1000 * Math.pow(2, i)) + Math.random() * 600;
+
+async function api(ruta, cuerpo) {
+  const op = {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + TOKEN }
+  };
+  if (cuerpo !== null) {
+    op.headers['Content-Type'] = 'application/json';
+    op.body = JSON.stringify(cuerpo);
+  }
+  /* Los endpoints sin argumentos van SIN cuerpo y SIN Content-Type, que es
+     lo que hace el ejemplo de la propia documentacion de Dropbox. Aqui no
+     hace falta el apaño de SubidaToken.gs: ese existe solo porque
+     UrlFetchApp obliga a poner un Content-Type en todo POST. */
+  const r = await pedir('https://api.dropboxapi.com/2/' + ruta, op);
+  const t = await r.text();
+  return t ? JSON.parse(t) : {};
+}
+
+async function contenido(ruta, arg, cuerpo) {
+  const r = await pedir('https://content.dropboxapi.com/2/' + ruta, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Bearer ' + TOKEN,
+      'Dropbox-API-Arg': argAscii(arg),
+      'Content-Type': 'application/octet-stream'
+    },
+    body: cuerpo
+  });
+  const t = await r.text();
+  return t ? JSON.parse(t) : {};
+}
+
+/* ===================================================================== */
+/*  HASH DE DROPBOX                                                      */
+/* ===================================================================== */
+
+const hex = (buf) => Array.from(new Uint8Array(buf))
+  .map((b) => b.toString(16).padStart(2, '0')).join('');
+
+/* Junta los digests de cada bloque de 4 MB y saca el SHA-256 del conjunto.
+   Es exactamente lo que hace Dropbox para su content_hash. */
+async function cerrarHash(digests) {
+  if (!digests.length) return HASH_VACIO;
+  const todo = new Uint8Array(digests.length * 32);
+  digests.forEach((d, i) => todo.set(d, i * 32));
+  return hex(await crypto.subtle.digest('SHA-256', todo));
+}
+
+async function hashDeTrozo(buf, digests) {
+  for (let o = 0; o < buf.byteLength; o += BLOQUE_HASH) {
+    const parte = buf.slice(o, Math.min(o + BLOQUE_HASH, buf.byteLength));
+    digests.push(new Uint8Array(await crypto.subtle.digest('SHA-256', parte)));
+  }
+}
+
+async function hashDeArchivo(file) {
+  const digests = [];
+  for (let o = 0; o < file.size; o += BLOQUE_HASH) {
+    const buf = await file.slice(o, Math.min(o + BLOQUE_HASH, file.size)).arrayBuffer();
+    digests.push(new Uint8Array(await crypto.subtle.digest('SHA-256', buf)));
+  }
+  return cerrarHash(digests);
+}
+
+/* ===================================================================== */
+/*  ELEGIR QUE SUBIR                                                     */
+/* ===================================================================== */
+
+$('btnCarpeta').addEventListener('click', async () => {
+  if (window.showDirectoryPicker) {
+    try {
+      const dir = await showDirectoryPicker({ mode: 'read' });
+      await recogerDeCarpeta(dir);
+    } catch (e) {
+      if (e.name !== 'AbortError') log('No se pudo abrir la carpeta: ' + e.message, 'l-mal');
+    }
+  } else {
+    $('inputCarpeta').click();
+  }
+});
+
+$('btnArchivos').addEventListener('click', () => $('inputArchivos').click());
+
+$('inputCarpeta').addEventListener('change', (e) => {
+  recogerDeInput(Array.from(e.target.files), true);
+});
+$('inputArchivos').addEventListener('change', (e) => {
+  recogerDeInput(Array.from(e.target.files), false);
+});
+
+async function recogerDeCarpeta(dir) {
+  log('Recorriendo «' + dir.name + '»…');
+  LISTA = [];
+  let n = 0;
+  async function recorrer(d, prefijo) {
+    for await (const [nombre, h] of d.entries()) {
+      if (PARAR) return;
+      const rel = prefijo ? prefijo + '/' + nombre : nombre;
+      if (h.kind === 'file') {
+        const f = await h.getFile();
+        LISTA.push({ rel: dir.name + '/' + rel, size: f.size, tomar: () => h.getFile() });
+        if (++n % 2000 === 0) { log('  ' + n + ' archivos…'); await dormir(0); }
+      } else {
+        await recorrer(h, rel);
+      }
+    }
+  }
+  await recorrer(dir, '');
+  terminarInventario();
+}
+
+function recogerDeInput(files, conRuta) {
+  LISTA = files.map((f) => ({
+    rel: conRuta ? (f.webkitRelativePath || f.name) : f.name,
+    size: f.size,
+    tomar: () => Promise.resolve(f)
+  }));
+  terminarInventario();
+}
+
+/* ===================================================================== */
+/*  INVENTARIO PREVIO                                                    */
+/* ===================================================================== */
+
+const IGNORA_DROPBOX = /^(\.dropbox(\.attr)?|desktop\.ini|thumbs\.db|\.ds_store|icon\r|\.spotlight-v100|\.trashes)$/i;
+const CARACTERES_MALOS = /[\\:?*"<>|]/;
+
+function revisar(rel) {
+  const problemas = [];
+  const partes = rel.split('/');
+  for (const p of partes) {
+    if (IGNORA_DROPBOX.test(p)) { problemas.push('Dropbox ignora «' + p + '»'); break; }
+    if (CARACTERES_MALOS.test(p)) problemas.push('caracteres no permitidos en «' + p + '»');
+    if (/[ .]$/.test(p)) problemas.push('«' + p + '» termina en espacio o punto');
+    if (p.length > 255) problemas.push('nombre de mas de 255 caracteres');
+  }
+  if (rel.length > 260) problemas.push('ruta larga (' + rel.length + ' caracteres)');
+  return problemas;
+}
+
+function terminarInventario() {
+  const total = LISTA.reduce((s, f) => s + f.size, 0);
+  let conProblemas = 0;
+  const muestra = [];
+  LISTA.forEach((f) => {
+    f.problemas = revisar(f.rel);
+    if (f.problemas.length) {
+      conProblemas++;
+      if (muestra.length < 12) muestra.push(f.rel + ' — ' + f.problemas.join('; '));
+    }
+  });
+
+  $('invArchivos').textContent = LISTA.length.toLocaleString('es-CO');
+  $('invPeso').textContent = pesoTxt(total);
+  $('invProblemas').textContent = conProblemas.toLocaleString('es-CO');
+  $('inventario').classList.remove('oculto');
+  $('estadoSeleccion').className = 'pill ok';
+  $('estadoSeleccion').textContent = LISTA.length.toLocaleString('es-CO') + ' archivos · ' + pesoTxt(total);
+
+  const caja = $('avisoProblemas');
+  if (conProblemas) {
+    caja.innerHTML = '<b>' + conProblemas + ' archivos con nombres o rutas problematicos.</b> ' +
+      'Son los que el cliente de escritorio suele saltarse en silencio. Por API ' +
+      'se intentan igual y los que fallen quedan en el informe.' +
+      '<ul class="probs">' + muestra.map((m) => '<li>' + escapar(m) + '</li>').join('') +
+      (conProblemas > muestra.length ? '<li>… y ' + (conProblemas - muestra.length) + ' mas</li>' : '') +
+      '</ul>';
+    caja.classList.remove('oculto');
+  } else {
+    caja.classList.add('oculto');
+  }
+
+  pintarDestinoPrevia();
+  log('Inventario: ' + LISTA.length.toLocaleString('es-CO') + ' archivos, ' +
+      pesoTxt(total) + ', ' + conProblemas + ' con problemas de nombre.', 'l-ok');
+  refrescarBotones();
+}
+
+$('destino').addEventListener('input', pintarDestinoPrevia);
+
+/* Enseña donde va a caer el primer archivo. Al elegir una carpeta, su
+   nombre ya va dentro de cada ruta relativa, asi que con destino «/» una
+   carpeta «calidad» queda en /calidad/... Ver la ruta final de un ejemplo
+   evita la equivocacion clasica: escribir /calidad de destino Y ademas
+   elegir la carpeta calidad, que da /calidad/calidad/... */
+function pintarDestinoPrevia() {
+  const caja = $('destinoPrevia');
+  if (!caja || !LISTA.length) return;
+  const destino = normalizarDestino($('destino').value);
+  const ejemplo = LISTA[0].rel;
+  caja.innerHTML = 'El primero va a quedar en <code>' +
+    escapar(destino + '/' + ejemplo) + '</code>' +
+    (esRaiz(destino) ? ' <span style="opacity:.75">(destino: la raiz de la cuenta)</span>' : '');
+
+  const primeraCarpeta = ejemplo.split('/')[0];
+  const ultimaDestino = destino.split('/').filter(Boolean).pop() || '';
+  const doble = $('avisoDoble');
+  if (ultimaDestino && ejemplo.indexOf('/') !== -1 &&
+      ultimaDestino.toLowerCase() === primeraCarpeta.toLowerCase()) {
+    doble.innerHTML = '<b>Ojo, se va a repetir la carpeta.</b> El destino termina en ' +
+      '«' + escapar(ultimaDestino) + '» y lo que eligio tambien empieza por ahi, ' +
+      'asi que quedaria <code>' + escapar(destino + '/' + ejemplo) + '</code>. ' +
+      'Si lo que quiere es <code>/' + escapar(ejemplo) + '</code>, ponga <code>/</code> en el destino.';
+    doble.classList.remove('oculto');
+  } else {
+    doble.classList.add('oculto');
+  }
+}
+
+const escapar = (s) => String(s).replace(/[&<>"']/g,
+  (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function refrescarBotones() {
+  const listo = !!TOKEN && LISTA.length > 0 && !CORRIENDO;
+  $('btnSubir').disabled = !listo;
+  $('btnVerificar').disabled = !listo;
+  $('btnInforme').disabled = INFORME.length === 0;
+}
+
+/* ===================================================================== */
+/*  LISTAR LO QUE YA ESTA EN DROPBOX                                     */
+/* ===================================================================== */
+
+/* En la API de Dropbox la raiz de la cuenta es la CADENA VACIA, no '/'.
+   Escribir '/' en una ruta de subida da error. Asi que '/' o vacio aqui
+   significan raiz y se devuelven como ''. Luego ruta = destino + '/' + rel
+   da '/archivo.txt', que es justo lo correcto para la raiz. */
+function normalizarDestino(v) {
+  let d = '/' + String(v || '').trim().replace(/^\/+|\/+$/g, '');
+  return d === '/' ? '' : d.replace(/\/+/g, '/');
+}
+
+const esRaiz = (d) => d === '';
+
+async function listarRemoto(destino) {
+  REMOTO = new Map();
+  /* Con destino raiz ('') hay que listar igual: si no, nada se puede saltar
+     al reanudar y «Verificar» dira que falta absolutamente todo. */
+  log('Listando lo que ya hay en ' + (esRaiz(destino) ? 'la raiz de la cuenta' : destino) + '…');
+  let res;
+  try {
+    res = await api('files/list_folder', { path: destino, recursive: true, limit: 2000 });
+  } catch (e) {
+    if (e instanceof ErrorDropbox && /not_found/.test(e.cuerpo)) {
+      log('La carpeta de destino todavia no existe; se creara sola.');
+      return;
+    }
+    throw e;
+  }
+  for (;;) {
+    for (const x of res.entries || []) {
+      if (x['.tag'] === 'file') {
+        REMOTO.set(x.path_lower, { size: x.size, hash: x.content_hash });
+      }
+    }
+    if (!res.has_more) break;
+    res = await api('files/list_folder/continue', { cursor: res.cursor });
+  }
+  log('Ya hay ' + REMOTO.size.toLocaleString('es-CO') + ' archivos en el destino.');
+}
+
+/* ===================================================================== */
+/*  SUBIR                                                                */
+/* ===================================================================== */
+
+async function subirArchivo(item, destino) {
+  const file = await item.tomar();
+  const ruta = destino + '/' + item.rel;
+  const digests = [];
+
+  if (file.size <= CFG.TROZO) {
+    const buf = await file.arrayBuffer();
+    await hashDeTrozo(buf, digests);
+    const meta = await contenido('files/upload', {
+      path: ruta, mode: 'overwrite', autorename: false, mute: true
+    }, buf);
+    return { meta, hashLocal: await cerrarHash(digests) };
+  }
+
+  /* Archivo grande: sesion por trozos. Cada trozo se lee del disco justo
+     antes de mandarlo, asi que la memoria no crece con el tamano. */
+  let offset = 0;
+  const primero = await file.slice(0, CFG.TROZO).arrayBuffer();
+  await hashDeTrozo(primero, digests);
+  const ses = await contenido('files/upload_session/start', { close: false }, primero);
+  offset += primero.byteLength;
+
+  while (file.size - offset > CFG.TROZO) {
+    if (PARAR) throw new Error('detenido');
+    const buf = await file.slice(offset, offset + CFG.TROZO).arrayBuffer();
+    await hashDeTrozo(buf, digests);
+    await contenido('files/upload_session/append_v2', {
+      cursor: { session_id: ses.session_id, offset: offset }, close: false
+    }, buf);
+    offset += buf.byteLength;
+  }
+
+  const ultimo = await file.slice(offset).arrayBuffer();
+  await hashDeTrozo(ultimo, digests);
+  const meta = await contenido('files/upload_session/finish', {
+    cursor: { session_id: ses.session_id, offset: offset },
+    commit: { path: ruta, mode: 'overwrite', autorename: false, mute: true }
+  }, ultimo);
+
+  return { meta, hashLocal: await cerrarHash(digests) };
+}
+
+async function correr(modo) {
+  if (CORRIENDO) return;
+  const destino = normalizarDestino($('destino').value);
+  if (esRaiz(destino) && modo === 'subir') {
+    /* En la raiz conviven las carpetas de todo el mundo, incluida
+       Aplicaciones. Como se sube con mode:'overwrite' —hace falta para poder
+       reanudar—, un nombre repetido pisaria un archivo ajeno. */
+    if (!confirm('Va a escribir en LA RAIZ de la cuenta de Dropbox, donde ' +
+                 'estan las carpetas de todo el mundo.\n\nSi algo que sube ' +
+                 'coincide de nombre con algo que ya esta ahi, lo reemplaza.\n\n' +
+                 '¿Seguir?')) {
+      log('Cancelado. Normalmente conviene una carpeta propia, por ejemplo /archivo-2026.', 'l-ojo');
+      return;
+    }
+    log('Destino: la raiz de la cuenta.', 'l-ojo');
+  }
+
+  CORRIENDO = true; PARAR = false; INFORME = [];
+  $('btnParar').classList.remove('oculto');
+  refrescarBotones();
+
+  let hechos = 0, saltados = 0, fallos = 0, bytes = 0, verificados = 0;
+  const totalBytes = LISTA.reduce((s, f) => s + f.size, 0);
+  const t0 = Date.now();
+
+  const pintar = () => {
+    $('cHechos').textContent = hechos.toLocaleString('es-CO');
+    $('cSaltados').textContent = saltados.toLocaleString('es-CO');
+    $('cFallos').textContent = fallos.toLocaleString('es-CO');
+    $('cPeso').textContent = pesoTxt(bytes);
+    const seg = (Date.now() - t0) / 1000;
+    const vel = seg > 1 ? bytes / seg : 0;
+    $('cVel').textContent = vel ? pesoTxt(vel) + '/s' : '—';
+    const hechosBytes = LISTA.slice(0, hechos + saltados + fallos).reduce((s, f) => s + f.size, 0);
+    $('barra').style.width = totalBytes ? (hechosBytes * 100 / totalBytes) + '%' : '0';
+    $('cFalta').textContent = vel ? tiempoTxt((totalBytes - bytes) / vel) : '—';
+  };
+
+  try {
+    await listarRemoto(destino);
+  } catch (e) {
+    log('No se pudo listar el destino: ' + e.message, 'l-mal');
+    CORRIENDO = false; $('btnParar').classList.add('oculto'); refrescarBotones();
+    return;
+  }
+
+  if (modo === 'subir') {
+    /* Un archivo que ya esta con OTRO tamano se sube encima (mode overwrite,
+       que es lo que permite reanudar un archivo a medias). Si lo que habia
+       no lo pusimos nosotros, eso es destruir algo ajeno: se avisa y queda
+       marcado aparte en el informe. */
+    const pisados = LISTA.filter((it) => {
+      const ya = REMOTO.get((destino + '/' + it.rel).toLowerCase());
+      return ya && ya.size !== it.size;
+    });
+    if (pisados.length) {
+      log('OJO: ' + pisados.length + ' archivos ya existen con otro tamano y se ' +
+          'van a REEMPLAZAR:', 'l-ojo');
+      pisados.slice(0, 10).forEach((it) => log('      ' + it.rel, 'l-ojo'));
+      if (pisados.length > 10) log('      … y ' + (pisados.length - 10) + ' mas', 'l-ojo');
+    }
+  }
+
+  log(modo === 'verificar'
+    ? 'Verificando ' + LISTA.length.toLocaleString('es-CO') + ' archivos por hash…'
+    : 'Subiendo a ' + (esRaiz(destino) ? 'la raiz' : destino) + '…', 'l-ok');
+
+  let siguiente = 0;
+  async function trabajador() {
+    while (!PARAR) {
+      const i = siguiente++;
+      if (i >= LISTA.length) return;
+      const item = LISTA[i];
+      const ruta = destino + '/' + item.rel;
+      const ya = REMOTO.get(ruta.toLowerCase());
+
+      try {
+        if (modo === 'verificar') {
+          const file = await item.tomar();
+          const hl = await hashDeArchivo(file);
+          if (!ya) {
+            fallos++;
+            INFORME.push({ rel: item.rel, size: item.size, estado: 'FALTA', hash_local: hl, hash_remoto: '', detalle: 'no esta en Dropbox' });
+            log('FALTA  ' + item.rel, 'l-mal');
+          } else if (ya.hash !== hl) {
+            fallos++;
+            INFORME.push({ rel: item.rel, size: item.size, estado: 'DIFIERE', hash_local: hl, hash_remoto: ya.hash, detalle: 'el contenido no coincide' });
+            log('DIFIERE  ' + item.rel, 'l-mal');
+          } else {
+            verificados++; hechos++;
+            INFORME.push({ rel: item.rel, size: item.size, estado: 'OK', hash_local: hl, hash_remoto: ya.hash, detalle: '' });
+          }
+          bytes += item.size;
+          pintar();
+          continue;
+        }
+
+        if (ya && ya.size === item.size) {
+          saltados++;
+          INFORME.push({ rel: item.rel, size: item.size, estado: 'YA ESTABA', hash_local: '', hash_remoto: ya.hash, detalle: 'mismo tamano; use Verificar para comprobar el contenido' });
+          pintar();
+          continue;
+        }
+
+        const reemplaza = !!ya;
+        const { meta, hashLocal } = await subirArchivo(item, destino);
+        bytes += item.size;
+        if (meta.content_hash && meta.content_hash !== hashLocal) {
+          fallos++;
+          INFORME.push({ rel: item.rel, size: item.size, estado: 'HASH DISTINTO', hash_local: hashLocal, hash_remoto: meta.content_hash, detalle: 'subio pero el contenido no coincide' });
+          log('HASH DISTINTO  ' + item.rel, 'l-mal');
+        } else {
+          hechos++;
+          INFORME.push({ rel: item.rel, size: item.size,
+            estado: reemplaza ? 'REEMPLAZADO' : 'SUBIDO',
+            hash_local: hashLocal, hash_remoto: meta.content_hash || '',
+            detalle: reemplaza ? 'ya existia con otro tamano' : '' });
+          if (item.size > 200 * 1024 * 1024) log('subido  ' + item.rel + '  (' + pesoTxt(item.size) + ')');
+        }
+        pintar();
+      } catch (e) {
+        if (String(e.message) === 'detenido') return;
+        fallos++;
+        INFORME.push({ rel: item.rel, size: item.size, estado: 'ERROR', hash_local: '', hash_remoto: '', detalle: e.message });
+        log('ERROR  ' + item.rel + ' — ' + e.message, 'l-mal');
+        pintar();
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: CFG.EN_PARALELO }, trabajador));
+
+  pintar();
+  CORRIENDO = false;
+  $('btnParar').classList.add('oculto');
+  refrescarBotones();
+
+  if (PARAR) {
+    log('Detenido. Lo que ya subio se conserva; al volver a empezar se salta.', 'l-ojo');
+    return;
+  }
+
+  if (modo === 'verificar') {
+    log(verificados.toLocaleString('es-CO') + ' verificados contra el hash de Dropbox, ' +
+        fallos + ' con problema.', fallos ? 'l-mal' : 'l-ok');
+  } else {
+    log('Terminado: ' + hechos + ' subidos, ' + saltados + ' ya estaban, ' + fallos + ' fallaron.',
+        fallos ? 'l-mal' : 'l-ok');
+    if (saltados) log('Los que «ya estaban» se saltaron por tamano. Pulse «Verificar todo» ' +
+                      'para comprobar el contenido de todos uno por uno.', 'l-ojo');
+  }
+}
+
+$('btnSubir').addEventListener('click', () => correr('subir'));
+$('btnVerificar').addEventListener('click', () => correr('verificar'));
+$('btnParar').addEventListener('click', () => {
+  PARAR = true;
+  log('Parando en cuanto terminen los archivos en curso…', 'l-ojo');
+});
+
+window.addEventListener('beforeunload', (e) => {
+  if (CORRIENDO) { e.preventDefault(); e.returnValue = ''; }
+});
+
+/* ===================================================================== */
+/*  INFORME                                                              */
+/* ===================================================================== */
+
+$('btnInforme').addEventListener('click', () => {
+  const esc = (v) => {
+    const s = String(v === undefined || v === null ? '' : v);
+    return /[";\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const cols = ['rel', 'size', 'estado', 'hash_local', 'hash_remoto', 'detalle'];
+  const csv = '﻿' + ['ruta;bytes;estado;hash_local;hash_remoto;detalle']
+    .concat(INFORME.map((r) => cols.map((c) => esc(r[c])).join(';')))
+    .join('\r\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = 'informe-subida-' + new Date().toISOString().slice(0, 10) + '.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+</script>
+</body>
+</html>

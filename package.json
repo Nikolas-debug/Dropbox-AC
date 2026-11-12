@@ -1,0 +1,10 @@
+{
+  "name": "subida-dropbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reparte tokens de Dropbox y sirve la pagina de subida masiva.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}

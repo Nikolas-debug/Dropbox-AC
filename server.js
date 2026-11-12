@@ -1,3 +1,20 @@
+/**
+ * SUBIDA MASIVA A DROPBOX — servicio de Railway
+ *
+ * Hace dos cosas, las dos pequeñas:
+ *
+ *   1. Sirve subida.html y subida-config.js desde public/. Al salir la
+ *      pagina del mismo origen que el token, no hay CORS que negociar.
+ *   2. POST /token  ->  devuelve un token de acceso de Dropbox a quien
+ *      traiga el secreto compartido.
+ *
+ * Los 150 GB NO pasan por aqui: van del navegador a Dropbox directo. Esto
+ * solo reparte el permiso, asi que el servicio puede ser del tamaño mas
+ * pequeño que haya.
+ *
+ * Sin dependencias a proposito: Node 18 ya trae fetch, y cada paquete es una
+ * cosa mas que puede romperse en un despliegue.
+ */
 
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -12,6 +29,11 @@ const CFG = {
   appKey:   process.env.DROPBOX_APP_KEY || '',
   appSecret: process.env.DROPBOX_APP_SECRET || '',
   refresh:  process.env.DROPBOX_REFRESH_TOKEN || '',
+  /* Usuario y clave de acceso. Protegen la PAGINA y el token a la vez.
+     Antes esto era un "secreto compartido" escrito en subida-config.js, lo
+     cual no servia de nada: la pagina es publica, asi que cualquiera que la
+     abriera leia el secreto y podia pedir tokens. Con Basic el navegador
+     pide credenciales antes de servir nada. */
   usuario:  process.env.SUBIDA_USUARIO || 'calidad',
   clave:    process.env.SUBIDA_CLAVE || '',
   /* Solo hace falta si la pagina se sirve desde otro dominio. Vacio = mismo
@@ -160,7 +182,7 @@ const servidor = createServer(async (req, res) => {
         DROPBOX_REFRESH_TOKEN: !!CFG.refresh,
         SUBIDA_CLAVE: !!CFG.clave
       },
-      pagina: existsSync(join(RAIZ, 'Dropbox.html')),
+      pagina: existsSync(join(RAIZ, 'subida.html')),
       token_en_cache: !!cache.token
     });
   }
@@ -232,5 +254,5 @@ servidor.listen(PUERTO, () => {
     DROPBOX_REFRESH_TOKEN: CFG.refresh, SUBIDA_CLAVE: CFG.clave
   }).filter(([, v]) => !v).map(([k]) => k);
   if (faltan.length) console.log('FALTAN variables en Railway: ' + faltan.join(', '));
-  if (!existsSync(join(RAIZ, 'Dropbox.html'))) console.log('FALTA public/subida.html');
+  if (!existsSync(join(RAIZ, 'subida.html'))) console.log('FALTA public/subida.html');
 });

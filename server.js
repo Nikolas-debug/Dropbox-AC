@@ -160,7 +160,7 @@ const servidor = createServer(async (req, res) => {
         DROPBOX_REFRESH_TOKEN: !!CFG.refresh,
         SUBIDA_CLAVE: !!CFG.clave
       },
-      pagina: existsSync(join(RAIZ, 'subida.html')),
+      pagina: existsSync(join(RAIZ, 'Dropbox.html')),
       token_en_cache: !!cache.token
     });
   }
@@ -232,5 +232,5 @@ servidor.listen(PUERTO, () => {
     DROPBOX_REFRESH_TOKEN: CFG.refresh, SUBIDA_CLAVE: CFG.clave
   }).filter(([, v]) => !v).map(([k]) => k);
   if (faltan.length) console.log('FALTAN variables en Railway: ' + faltan.join(', '));
-  if (!existsSync(join(RAIZ, 'subida.html'))) console.log('FALTA public/subida.html');
+  if (!existsSync(join(RAIZ, 'Dropbox.html'))) console.log('FALTA public/subida.html');
 });

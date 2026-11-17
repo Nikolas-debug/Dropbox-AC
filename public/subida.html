@@ -65,6 +65,14 @@
   .pill.mal { color: var(--mal); background: #fdecea; border-color: #f5c6c2; }
   .barra { height: 10px; background: #e8eff5; border-radius: 999px; overflow: hidden; margin: 12px 0 6px; }
   .barra > div { height: 100%; width: 0; background: var(--azul); transition: width .25s; }
+  .en-curso {
+    margin-top: 12px; font-size: .82rem; color: var(--gris);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .en-curso b { color: var(--texto); font-weight: 600; }
+  #fallos ul { margin: 6px 0 0; padding-left: 18px; }
+  #fallos li { margin-bottom: 3px; font-size: .82rem; }
   .cifras { display: flex; gap: 22px; flex-wrap: wrap; font-size: .85rem; color: var(--gris); }
   .cifras b { display: block; font-size: 1.15rem; color: var(--texto); font-weight: 700;
               font-variant-numeric: tabular-nums; }
@@ -158,6 +166,7 @@
     <div style="flex:0 0 auto"><button class="sec" id="btnInforme" disabled>Descargar informe</button></div>
   </div>
 
+  <div id="enCurso" class="en-curso oculto"></div>
   <div class="barra"><div id="barra"></div></div>
   <div class="cifras">
     <div><b id="cHechos">0</b> subidos</div>
@@ -168,6 +177,7 @@
     <div><b id="cFalta">—</b> falta</div>
   </div>
 
+  <div id="fallos" class="aviso mal oculto" style="margin-top:14px"></div>
   <div id="log"></div>
 </div>
 
@@ -785,10 +795,37 @@ async function listarRemoto(destino) {
 /*  SUBIR                                                                */
 /* ===================================================================== */
 
-async function subirArchivo(item, destino) {
+/* --------------------------------------------------------------------
+   Sesiones a medias. Para un zip de 150 GB, que la pestaña se cierre al
+   90% y haya que empezar de cero es inaceptable: son horas tiradas.
+   Dropbox mantiene abierta la sesion de subida, asi que se guarda su id y
+   el offset, y al volver se retoma donde iba.
+
+   Lo ya subido no se puede re-leer de Dropbox para calcular su hash, asi
+   que se vuelve a leer del DISCO (rapido, no hay red de por medio) para
+   rehacer los digests y que el hash final siga saliendo correcto.
+   -------------------------------------------------------------------- */
+
+const LLAVE_SESIONES = 'subida_sesiones';
+
+function sesiones() {
+  try { return JSON.parse(localStorage.getItem(LLAVE_SESIONES) || '{}'); }
+  catch (e) { return {}; }
+}
+function guardarSesion(clave, datos) {
+  try {
+    const s = sesiones();
+    if (datos) s[clave] = datos; else delete s[clave];
+    localStorage.setItem(LLAVE_SESIONES, JSON.stringify(s));
+  } catch (e) { /* sin localStorage se pierde la reanudacion, nada mas */ }
+}
+const claveSesion = (ruta, size) => ruta + '|' + size;
+
+async function subirArchivo(item, destino, alAvanzar) {
   const file = await item.tomar();
   const ruta = destino + '/' + item.rel;
   const digests = [];
+  const avanzar = (n) => { if (alAvanzar) alAvanzar(n); };
 
   if (file.size <= CFG.TROZO) {
     const buf = await file.arrayBuffer();
@@ -796,25 +833,68 @@ async function subirArchivo(item, destino) {
     const meta = await contenido('files/upload', {
       path: ruta, mode: 'overwrite', autorename: false, mute: true
     }, buf);
+    avanzar(buf.byteLength);
     return { meta, hashLocal: await cerrarHash(digests) };
   }
 
   /* Archivo grande: sesion por trozos. Cada trozo se lee del disco justo
      antes de mandarlo, asi que la memoria no crece con el tamano. */
+  const clave = claveSesion(ruta, file.size);
+  const previa = sesiones()[clave];
+  let ses = null;
   let offset = 0;
-  const primero = await file.slice(0, CFG.TROZO).arrayBuffer();
-  await hashDeTrozo(primero, digests);
-  const ses = await contenido('files/upload_session/start', { close: false }, primero);
-  offset += primero.byteLength;
+
+  if (previa && previa.session_id && previa.offset > 0 && previa.offset < file.size) {
+    try {
+      log('Retomando «' + item.rel + '» desde ' + pesoTxt(previa.offset) +
+          ' (' + Math.round(previa.offset * 100 / file.size) + '%)…', 'l-ok');
+      /* Rehacer los digests de lo ya subido, leyendo del disco. */
+      for (let o = 0; o < previa.offset; o += CFG.TROZO) {
+        if (PARAR) throw new Error('detenido');
+        const trozo = await file.slice(o, Math.min(o + CFG.TROZO, previa.offset)).arrayBuffer();
+        await hashDeTrozo(trozo, digests);
+      }
+      ses = { session_id: previa.session_id };
+      offset = previa.offset;
+      avanzar(offset);
+    } catch (e) {
+      if (String(e.message) === 'detenido') throw e;
+      log('No se pudo retomar; se empieza de nuevo.', 'l-ojo');
+      ses = null; offset = 0; digests.length = 0;
+    }
+  }
+
+  if (!ses) {
+    const primero = await file.slice(0, CFG.TROZO).arrayBuffer();
+    await hashDeTrozo(primero, digests);
+    ses = await contenido('files/upload_session/start', { close: false }, primero);
+    offset = primero.byteLength;
+    guardarSesion(clave, { session_id: ses.session_id, offset: offset });
+    avanzar(primero.byteLength);
+  }
 
   while (file.size - offset > CFG.TROZO) {
     if (PARAR) throw new Error('detenido');
     const buf = await file.slice(offset, offset + CFG.TROZO).arrayBuffer();
     await hashDeTrozo(buf, digests);
-    await contenido('files/upload_session/append_v2', {
-      cursor: { session_id: ses.session_id, offset: offset }, close: false
-    }, buf);
+    try {
+      await contenido('files/upload_session/append_v2', {
+        cursor: { session_id: ses.session_id, offset: offset }, close: false
+      }, buf);
+    } catch (e) {
+      /* Si la sesion caduco o el offset no cuadra, no hay arreglo parcial:
+         se descarta y el archivo se reintenta desde cero en la pasada
+         siguiente. Mejor eso que subir algo incompleto. */
+      if (e instanceof ErrorDropbox && /incorrect_offset|not_found|closed/.test(e.cuerpo)) {
+        guardarSesion(clave, null);
+        throw new Error('la sesion de subida ya no vale; vuelva a pulsar Subir ' +
+                        'para empezar este archivo de nuevo');
+      }
+      throw e;
+    }
     offset += buf.byteLength;
+    guardarSesion(clave, { session_id: ses.session_id, offset: offset });
+    avanzar(buf.byteLength);
   }
 
   const ultimo = await file.slice(offset).arrayBuffer();
@@ -823,6 +903,8 @@ async function subirArchivo(item, destino) {
     cursor: { session_id: ses.session_id, offset: offset },
     commit: { path: ruta, mode: 'overwrite', autorename: false, mute: true }
   }, ultimo);
+  avanzar(ultimo.byteLength);
+  guardarSesion(clave, null);
 
   return { meta, hashLocal: await cerrarHash(digests) };
 }
@@ -852,17 +934,59 @@ async function correr(modo) {
   const totalBytes = LISTA.reduce((s, f) => s + f.size, 0);
   const t0 = Date.now();
 
+  /* Lo que esta subiendo ahora mismo: rel -> bytes ya mandados. Con un zip
+     unico de 150 GB es lo unico que se mueve durante horas, asi que la
+     barra y el tiempo que falta salen de aqui, no de archivos terminados. */
+  const EN_VUELO = new Map();
+  const VISTOS = [];   // fallos, para el panel de arriba
+
+  const pintarEnCurso = () => {
+    const caja = $('enCurso');
+    if (!EN_VUELO.size) { caja.classList.add('oculto'); caja.innerHTML = ''; return; }
+    caja.classList.remove('oculto');
+    caja.innerHTML = Array.from(EN_VUELO.entries()).slice(0, 3).map(([rel, d]) =>
+      '<b>' + escapar(rel) + '</b> · ' + pesoTxt(d.hecho) + ' de ' + pesoTxt(d.size) +
+      ' (' + Math.floor(d.hecho * 100 / (d.size || 1)) + '%)'
+    ).join('<br>');
+  };
+
+  const pintarFallos = () => {
+    const caja = $('fallos');
+    if (!VISTOS.length) { caja.classList.add('oculto'); caja.innerHTML = ''; return; }
+    caja.classList.remove('oculto');
+    const muestra = VISTOS.slice(-12).reverse();
+    caja.innerHTML = '<b>' + VISTOS.length + (VISTOS.length === 1 ? ' problema' : ' problemas') +
+      '</b><ul>' + muestra.map((f) =>
+        '<li><code>' + escapar(f.rel) + '</code> — ' + escapar(f.estado) +
+        (f.detalle ? ': ' + escapar(f.detalle) : '') + '</li>').join('') + '</ul>' +
+      (VISTOS.length > muestra.length
+        ? '<div style="margin-top:4px">… y ' + (VISTOS.length - muestra.length) +
+          ' mas. El informe CSV los trae todos.</div>' : '');
+  };
+
+  const anotarFallo = (rel, estado, detalle) => {
+    fallos++;
+    VISTOS.push({ rel: rel, estado: estado, detalle: detalle || '' });
+  };
+
   const pintar = () => {
     $('cHechos').textContent = hechos.toLocaleString('es-CO');
     $('cSaltados').textContent = saltados.toLocaleString('es-CO');
     $('cFallos').textContent = fallos.toLocaleString('es-CO');
-    $('cPeso').textContent = pesoTxt(bytes);
+    /* Lo terminado mas lo que llevan los archivos en vuelo. */
+    let enVuelo = 0;
+    EN_VUELO.forEach((d) => { enVuelo += d.hecho; });
+    const avance = bytes + enVuelo;
+    $('cPeso').textContent = pesoTxt(avance);
     const seg = (Date.now() - t0) / 1000;
-    const vel = seg > 1 ? bytes / seg : 0;
+    const vel = seg > 1 ? avance / seg : 0;
     $('cVel').textContent = vel ? pesoTxt(vel) + '/s' : '—';
-    const hechosBytes = LISTA.slice(0, hechos + saltados + fallos).reduce((s, f) => s + f.size, 0);
-    $('barra').style.width = totalBytes ? (hechosBytes * 100 / totalBytes) + '%' : '0';
-    $('cFalta').textContent = vel ? tiempoTxt((totalBytes - bytes) / vel) : '—';
+    $('barra').style.width = totalBytes
+      ? Math.min(100, avance * 100 / totalBytes) + '%' : '0';
+    $('cFalta').textContent = vel && avance < totalBytes
+      ? tiempoTxt((totalBytes - avance) / vel) : '—';
+    pintarEnCurso();
+    pintarFallos();
   };
 
   try {
@@ -908,11 +1032,11 @@ async function correr(modo) {
           const file = await item.tomar();
           const hl = await hashDeArchivo(file);
           if (!ya) {
-            fallos++;
+            anotarFallo(item.rel, 'FALTA', 'no esta en Dropbox');
             INFORME.push({ rel: item.rel, size: item.size, estado: 'FALTA', hash_local: hl, hash_remoto: '', detalle: 'no esta en Dropbox' });
             log('FALTA  ' + item.rel, 'l-mal');
           } else if (ya.hash !== hl) {
-            fallos++;
+            anotarFallo(item.rel, 'DIFIERE', 'el contenido no coincide');
             INFORME.push({ rel: item.rel, size: item.size, estado: 'DIFIERE', hash_local: hl, hash_remoto: ya.hash, detalle: 'el contenido no coincide' });
             log('DIFIERE  ' + item.rel, 'l-mal');
           } else {
@@ -932,10 +1056,23 @@ async function correr(modo) {
         }
 
         const reemplaza = !!ya;
-        const { meta, hashLocal } = await subirArchivo(item, destino);
+        /* El avance se cuenta trozo a trozo (cada ~48 MB), no al terminar el
+           archivo: si no, un zip de 150 GB dejaria la barra en cero durante
+           horas y luego saltaria al 100%. */
+        EN_VUELO.set(item.rel, { size: item.size, hecho: 0 });
+        let meta, hashLocal;
+        try {
+          const r = await subirArchivo(item, destino, (n) => {
+            const d = EN_VUELO.get(item.rel);
+            if (d) { d.hecho += n; pintar(); }
+          });
+          meta = r.meta; hashLocal = r.hashLocal;
+        } finally {
+          EN_VUELO.delete(item.rel);
+        }
         bytes += item.size;
         if (meta.content_hash && meta.content_hash !== hashLocal) {
-          fallos++;
+          anotarFallo(item.rel, 'HASH DISTINTO', 'subio pero el contenido no coincide');
           INFORME.push({ rel: item.rel, size: item.size, estado: 'HASH DISTINTO', hash_local: hashLocal, hash_remoto: meta.content_hash, detalle: 'subio pero el contenido no coincide' });
           log('HASH DISTINTO  ' + item.rel, 'l-mal');
         } else {
@@ -949,7 +1086,7 @@ async function correr(modo) {
         pintar();
       } catch (e) {
         if (String(e.message) === 'detenido') return;
-        fallos++;
+        anotarFallo(item.rel, 'ERROR', e.message);
         INFORME.push({ rel: item.rel, size: item.size, estado: 'ERROR', hash_local: '', hash_remoto: '', detalle: e.message });
         log('ERROR  ' + item.rel + ' — ' + e.message, 'l-mal');
         pintar();

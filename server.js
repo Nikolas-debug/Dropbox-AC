@@ -18,11 +18,17 @@
 
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const RAIZ = join(fileURLToPath(new URL('.', import.meta.url)), 'public');
+const AQUI = fileURLToPath(new URL('.', import.meta.url));
+
+/* Lo normal es public/, pero si alguien deja subida.html junto a server.js
+   tambien vale. Mejor servir la pagina que tener razon sobre la carpeta. */
+const RAIZ = existsSync(join(AQUI, 'public', 'subida.html'))
+  ? join(AQUI, 'public')
+  : AQUI;
 const PUERTO = process.env.PORT || 3000;
 
 const CFG = {
@@ -94,6 +100,16 @@ async function tokenDeAcceso(forzar) {
 
   cache = { token: d.access_token, vence: Date.now() + (d.expires_in || 14400) * 1000 };
   return { token: d.access_token, vence_en: d.expires_in || 14400 };
+}
+
+function listar(dir) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .map((e) => e.name + (e.isDirectory() ? '/' : ''))
+      .slice(0, 40);
+  } catch (e) {
+    return ['(no se pudo leer: ' + e.code + ')'];
+  }
 }
 
 function responder(res, codigo, cuerpo) {
@@ -183,6 +199,8 @@ const servidor = createServer(async (req, res) => {
         SUBIDA_CLAVE: !!CFG.clave
       },
       pagina: existsSync(join(RAIZ, 'subida.html')),
+      sirviendo_desde: RAIZ,
+      hay_aqui: listar(RAIZ),
       token_en_cache: !!cache.token
     });
   }
@@ -230,7 +248,16 @@ const servidor = createServer(async (req, res) => {
   const rel = ruta === '/' ? 'subida.html' : normalize(ruta).replace(/^(\.\.[/\\])+/, '').replace(/^[/\\]+/, '');
   const archivo = join(RAIZ, rel);
   if (!archivo.startsWith(RAIZ) || !existsSync(archivo)) {
-    return responder(res, 404, { ok: false, error: 'No existe ' + ruta });
+    /* Quien llega aqui ya paso por Basic, asi que se le puede enseñar que
+       hay de verdad en el servidor. Sin esto, un «No existe /» no dice si
+       falta el archivo, si esta en otra carpeta o si no se desplego. */
+    return responder(res, 404, {
+      ok: false,
+      error: 'No existe ' + ruta + (ruta === '/' ? ' (falta subida.html)' : ''),
+      busque_en: RAIZ,
+      hay_aqui: listar(RAIZ),
+      junto_al_server: listar(AQUI)
+    });
   }
   try {
     const datos = await readFile(archivo);
@@ -254,5 +281,9 @@ servidor.listen(PUERTO, () => {
     DROPBOX_REFRESH_TOKEN: CFG.refresh, SUBIDA_CLAVE: CFG.clave
   }).filter(([, v]) => !v).map(([k]) => k);
   if (faltan.length) console.log('FALTAN variables en Railway: ' + faltan.join(', '));
-  if (!existsSync(join(RAIZ, 'subida.html'))) console.log('FALTA public/subida.html');
+  console.log('Sirviendo la pagina desde: ' + RAIZ);
+  if (!existsSync(join(RAIZ, 'subida.html'))) {
+    console.log('FALTA subida.html. Lo que hay en esa carpeta: ' + listar(RAIZ).join(', '));
+    console.log('Y junto a server.js: ' + listar(AQUI).join(', '));
+  }
 });
